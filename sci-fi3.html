@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Controlled Solar System</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        canvas { display: block; }
+        
+        /* UI Overlay Layer */
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* Planet Name Title */
+        #planet-title {
+            position: absolute;
+            top: 40px;
+            width: 100%;
+            text-align: center;
+            font-size: 3rem;
+            font-weight: 800;
+            color: white;
+            text-transform: uppercase;
+            letter-spacing: 10px;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.5);
+            transition: opacity 0.5s;
+        }
+
+        /* Gesture Guide Panel */
+        #guide-panel {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            font-size: 0.9rem;
+            width: 200px;
+        }
+        
+        .guide-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .guide-icon {
+            font-size: 1.5rem;
+            margin-right: 15px;
+            width: 30px;
+            text-align: center;
+        }
+
+        /* Status Text */
+        #status {
+            position: absolute;
+            bottom: 30px;
+            left: 30px;
+            color: #00ff88;
+            font-family: monospace;
+        }
+
+        /* Hidden Video for AI Processing */
+        #input_video {
+            display: none; 
+            /* To debug camera view, comment out 'display: none' and add styles */
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="planet-title">SOLAR SYSTEM</div>
+        
+        <div id="guide-panel">
+            <div style="font-weight:bold; margin-bottom:15px; opacity:0.7;">CONTROLS</div>
+            <div class="guide-item">
+                <span class="guide-icon">🖐️</span>
+                <span>Next Planet</span>
+            </div>
+            <div class="guide-item">
+                <span class="guide-icon">✊</span>
+                <span>Zoom & Fast</span>
+            </div>
+            <div class="guide-item">
+                <span class="guide-icon">✌️</span>
+                <span>Reset View</span>
+            </div>
+        </div>
+
+        <div id="status">Initializing AI Model...</div>
+    </div>
+
+    <video id="input_video"></video>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const CONFIG = {
+            camZ: 50,
+            orbitSpeedBase: 0.5,
+            rotationSpeedBase: 0.005,
+            transitionSpeed: 0.05
+        };
+
+        // --- GLOBAL STATE ---
+        let currentPlanetIndex = 0; // 0=Sun (overview), 1=Earth, 2=Mars, 3=Jupiter, 4=Saturn
+        let isZoomed = false;
+        let speedMultiplier = 1.0;
+        let lastGestureTime = 0;
+        const COOLDOWN_MS = 1500; // Time between switching planets
+
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        // Fog for depth
+        scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 20, 100);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x333333);
+        scene.add(ambientLight);
+        
+        const sunLight = new THREE.PointLight(0xffffff, 2, 400);
+        sunLight.position.set(0, 0, 0);
+        scene.add(sunLight);
+
+        // --- HELPERS ---
+        function createPlanet(size, color, distance, name) {
+            // Pivot group allows orbiting around 0,0,0
+            const pivot = new THREE.Group();
+            scene.add(pivot);
+
+            // Mesh
+            const geometry = new THREE.SphereGeometry(size, 32, 32);
+            const material = new THREE.MeshStandardMaterial({ 
+                color: color,
+                roughness: 0.7,
+                metalness: 0.1
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            
+            // Offset mesh from pivot center to create orbit radius
+            mesh.position.x = distance;
+            pivot.add(mesh);
+
+            // Ring for Saturn
+            if(name === "SATURN") {
+                const ringGeo = new THREE.RingGeometry(size * 1.4, size * 2.2, 32);
+                const ringMat = new THREE.MeshBasicMaterial({ 
+                    color: 0x888888, 
+                    side: THREE.DoubleSide, 
+                    transparent: true, 
+                    opacity: 0.6 
+                });
+                const ring = new THREE.Mesh(ringGeo, ringMat);
+                ring.rotation.x = Math.PI / 2.5; // Tilt ring
+                mesh.add(ring);
+            }
+
+            return { pivot, mesh, distance, name, size };
+        }
+
+        // --- SCENE OBJECTS ---
+        
+        // Stars
+        const starsGeo = new THREE.BufferGeometry();
+        const starsCount = 5000;
+        const posArray = new Float32Array(starsCount * 3);
+        for(let i=0; i<starsCount*3; i++) {
+            posArray[i] = (Math.random() - 0.5) * 800;
+        }
+        starsGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const starsMat = new THREE.PointsMaterial({size: 0.5, color: 0xffffff});
+        const stars = new THREE.Points(starsGeo, starsMat);
+        scene.add(stars);
+
+        // Sun
+        const sunGeo = new THREE.SphereGeometry(8, 32, 32);
+        const sunMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 }); // Emissive look
+        const sun = new THREE.Mesh(sunGeo, sunMat);
+        scene.add(sun);
+        // Sun Glow
+        const glowGeo = new THREE.SphereGeometry(9, 32, 32);
+        const glowMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.3 });
+        const sunGlow = new THREE.Mesh(glowGeo, glowMat);
+        scene.add(sunGlow);
+
+        // Planets
+        const planets = [];
+        // Note: Distances are scaled for visual clarity, not realism
+        planets.push({ mesh: sun, name: "SUN", pivot: new THREE.Group() }); // Index 0 is Sun/Overview
+        planets.push(createPlanet(2, 0x2233ff, 25, "EARTH"));    // Index 1
+        planets.push(createPlanet(1.5, 0xff4422, 40, "MARS"));   // Index 2
+        planets.push(createPlanet(5, 0xddaa88, 65, "JUPITER"));  // Index 3
+        planets.push(createPlanet(4, 0xccbb99, 90, "SATURN"));   // Index 4
+
+        // --- MEDIAPIPE LOGIC ---
+        const videoElement = document.getElementById('input_video');
+        const statusElement = document.getElementById('status');
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                detectGesture(landmarks);
+                statusElement.innerText = "System Active | Hand Detected";
+            } else {
+                // No hand detected
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.5
+        });
+        
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        cameraUtils.start();
+
+        // --- GESTURE RECOGNITION ---
+        function detectGesture(landmarks) {
+            const now = Date.now();
+            
+            // Finger Tips
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            
+            // Finger DIPs (Knuckles near tip) - used to check if curled
+            const indexDip = landmarks[7];
+            const middleDip = landmarks[11];
+            const ringDip = landmarks[15];
+            const pinkyDip = landmarks[19];
+
+            // Helper: Is finger extended? (Tip higher than knuckle)
+            // Note: In MediaPipe, Y increases downwards. So Tip.y < Dip.y means extended up.
+            const isIndexOpen = indexTip.y < indexDip.y;
+            const isMiddleOpen = middleTip.y < middleDip.y;
+            const isRingOpen = ringTip.y < ringDip.y;
+            const isPinkyOpen = pinkyTip.y < pinkyDip.y;
+            
+            // Simple logic for Thumb (check x distance from palm center for simplicity or just ignore)
+            // We'll focus on the 4 main fingers for robustness.
+
+            // 1. FIST (All Closed)
+            if (!isIndexOpen && !isMiddleOpen && !isRingOpen && !isPinkyOpen) {
+                // Gesture: Zoom In & Spin Fast
+                isZoomed = true;
+                speedMultiplier = 4.0;
+            }
+            
+            // 2. PEACE SIGN (Index & Middle Open, Ring & Pinky Closed)
+            else if (isIndexOpen && isMiddleOpen && !isRingOpen && !isPinkyOpen) {
+                // Gesture: Reset
+                isZoomed = false;
+                speedMultiplier = 1.0;
+            }
+
+            // 3. OPEN HAND (All Open)
+            else if (isIndexOpen && isMiddleOpen && isRingOpen && isPinkyOpen) {
+                // Gesture: Next Planet
+                // Use cooldown to prevent rapid switching
+                if (now - lastGestureTime > COOLDOWN_MS) {
+                    cyclePlanet();
+                    lastGestureTime = now;
+                }
+            }
+        }
+
+        function cyclePlanet() {
+            currentPlanetIndex++;
+            if (currentPlanetIndex >= planets.length) {
+                currentPlanetIndex = 1; // Loop back to Earth (skip Sun index 0 for flow)
+            }
+            
+            const pName = planets[currentPlanetIndex].name;
+            document.getElementById('planet-title').innerText = pName;
+            
+            // Flash effect
+            document.getElementById('planet-title').style.opacity = 0;
+            setTimeout(() => { document.getElementById('planet-title').style.opacity = 1; }, 100);
+            
+            // Reset state on switch
+            isZoomed = false;
+            speedMultiplier = 1.0;
+        }
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+        const targetCameraPos = new THREE.Vector3();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            // 1. Update Orbits & Rotation
+            planets.forEach((p, index) => {
+                if (index === 0) return; // Skip Sun pivot
+
+                // Orbit logic
+                // Different speeds based on distance
+                const orbitSpeed = CONFIG.orbitSpeedBase / (index * 0.5); 
+                p.pivot.rotation.y += orbitSpeed * delta * speedMultiplier;
+                
+                // Self Rotation
+                p.mesh.rotation.y += CONFIG.rotationSpeedBase * delta * speedMultiplier * 10;
+            });
+
+            // 2. Camera Controls
+            let targetObj = planets[currentPlanetIndex];
+            
+            if (currentPlanetIndex === 0) {
+                // Overview Mode (Sun)
+                targetCameraPos.set(0, 40, 120);
+                camera.lookAt(0, 0, 0);
+            } else {
+                // Follow Planet Mode
+                // Get world position of the planet mesh
+                const planetWorldPos = new THREE.Vector3();
+                targetObj.mesh.getWorldPosition(planetWorldPos);
+
+                // Calculate desired camera offset
+                // If zoomed: close and low. If normal: higher and further back.
+                const offsetDistance = isZoomed ? targetObj.size * 3 : targetObj.size * 8;
+                const offsetHeight = isZoomed ? targetObj.size * 0.5 : targetObj.size * 3;
+                
+                // Calculate offset vector relative to the planet's position vs the center
+                // Simple approach: Place camera "behind" the planet relative to the sun
+                // Or just a fixed offset for simplicity in 3D space
+                
+                // Let's position camera relative to the planet
+                const offset = new THREE.Vector3(0, offsetHeight, offsetDistance);
+                
+                // Add the offset to the planet position
+                // To make it dynamic, we can apply the pivot's rotation to the offset, 
+                // but let's keep it simple: camera follows smoothly in world space.
+                
+                // We want the camera to look at the planet.
+                // We want the camera to be at PlanetPos + (some vector).
+                // Let's put the camera "outside" the solar system looking in.
+                
+                const angle = targetObj.pivot.rotation.y;
+                const dist = targetObj.distance + offsetDistance;
+                
+                const camX = Math.sin(angle) * dist;
+                const camZ = Math.cos(angle) * dist;
+                
+                targetCameraPos.set(camX, offsetHeight + 5, camZ);
+            }
+
+            // Smooth Camera Movement (Lerp)
+            camera.position.lerp(targetCameraPos, 0.05);
+            
+            // Smooth LookAt
+            const lookTarget = new THREE.Vector3();
+            if(currentPlanetIndex > 0) {
+                planets[currentPlanetIndex].mesh.getWorldPosition(lookTarget);
+            }
+            // Create a dummy object to help lerp the lookAt (quaternion slerp is better but this is simple)
+            // For now, snap lookAt to keep planet centered
+            camera.lookAt(lookTarget);
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+
+    </script>
+</body>
+</html>
